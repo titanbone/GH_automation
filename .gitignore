@@ -1,0 +1,24 @@
+# PlatformIO build
+.pio/
+.pioenvs/
+.piolibdeps/
+
+# IDE
+.vscode/.browse.c_cpp.db*
+.vscode/ipch/
+.idea/
+
+# Binaries
+*.bin
+*.elf
+*.map
+
+# Secrets (če kdaj dodaš ločeno konfiguracijo)
+.env
+.env.*
+**/secrets*
+config.local.h
+
+# OS
+.DS_Store
+Thumbs.db
