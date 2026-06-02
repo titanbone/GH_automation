@@ -6,6 +6,8 @@
 #include <Arduino.h>
 #include <SPI.h>
 #include <string.h>
+#include <WiFi.h>
+#include <WebServer.h>
 #include <TFT_eSPI.h>
 #include <XPT2046_Touchscreen.h>
 
@@ -21,6 +23,7 @@ int TFT_H = 240;
 TFT_eSPI tft = TFT_eSPI();
 // Enako kot cyd_demo: CS 33, IRQ 36 (delujoča kombinacija)
 XPT2046_Touchscreen touch(TOUCH_CS, TOUCH_IRQ);
+WebServer webServer(WEB_SERVER_PORT);
 
 #define COLOR_BG            0x3186
 #define COLOR_HEADER        0xFFFF   // belo ozadje headerja
@@ -53,9 +56,135 @@ int    graphSensor   = 0;
 uint32_t lastDraw = 0, lastSimUpdate = 0;
 int8_t  pendingHeaderBtn = -1;      // 0=FAN, 1=IRR, -1=ni
 uint32_t pendingHeaderStart = 0;
+bool hasTimeSync = false;
+uint32_t syncedAtMs = 0;
+uint32_t syncedEpoch = 0;
+
+static void handleWebRoot() {
+  static const char PAGE[] PROGMEM = R"HTML(
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>GRENSAN Demo</title>
+  <style>
+    body { font-family: Arial, sans-serif; margin: 16px; background: #f3f7fb; color: #0d2b55; }
+    .card { background: #fff; border-radius: 12px; padding: 14px; margin-bottom: 12px; box-shadow: 0 2px 8px rgba(0,0,0,.08); }
+    h1 { margin: 0 0 10px 0; font-size: 22px; }
+    .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+    .val { font-size: 26px; font-weight: 700; color: #003a8c; }
+    .lbl { font-size: 13px; color: #4d6f99; }
+    .pill { display: inline-block; padding: 6px 10px; border-radius: 999px; color: #fff; font-weight: 700; font-size: 12px; }
+    .on { background: #00a651; }
+    .off { background: #1e5aa8; }
+  </style>
+</head>
+<body>
+  <h1>GRENSAN Demo (simulacija)</h1>
+  <div class="card">
+    <div>AP SSID: <b>GRENSAN-DEMO</b></div>
+    <div>IP ESP32: <b id="ip">192.168.4.1</b></div>
+  </div>
+  <div class="card">
+    <span class="pill" id="fan">FAN</span>
+    <span class="pill" id="irr">IRR</span>
+  </div>
+  <div class="grid">
+    <div class="card"><div class="lbl">Vlaga</div><div class="val" id="moisture">-</div></div>
+    <div class="card"><div class="lbl">Temp1</div><div class="val" id="temp1">-</div></div>
+    <div class="card"><div class="lbl">Temp2</div><div class="val" id="temp2">-</div></div>
+    <div class="card"><div class="lbl">Temp3</div><div class="val" id="temp3">-</div></div>
+    <div class="card"><div class="lbl">Soil temp</div><div class="val" id="soilTemp">-</div></div>
+    <div class="card"><div class="lbl">Soil hum</div><div class="val" id="soilHum">-</div></div>
+  </div>
+  <script>
+    function setRelay(el, on, name) {
+      el.textContent = name + ': ' + (on ? 'ON' : 'OFF');
+      el.className = 'pill ' + (on ? 'on' : 'off');
+    }
+    async function refresh() {
+      if (!window._timeSynced) {
+        window._timeSynced = true;
+        fetch('/api/setTime?ts=' + Math.floor(Date.now() / 1000)).catch(() => {});
+      }
+      const r = await fetch('/api/status');
+      const d = await r.json();
+      document.getElementById('ip').textContent = d.ip;
+      document.getElementById('moisture').textContent = d.moisture.toFixed(1) + '%';
+      document.getElementById('temp1').textContent = d.temp1.toFixed(1) + 'C';
+      document.getElementById('temp2').textContent = d.temp2.toFixed(1) + 'C';
+      document.getElementById('temp3').textContent = d.temp3.toFixed(1) + 'C';
+      document.getElementById('soilTemp').textContent = d.soilTemp.toFixed(1) + 'C';
+      document.getElementById('soilHum').textContent = d.soilHum.toFixed(1) + '%';
+      setRelay(document.getElementById('fan'), d.relayFan, 'FAN');
+      setRelay(document.getElementById('irr'), d.relayWater, 'IRR');
+    }
+    refresh();
+    setInterval(refresh, 1500);
+  </script>
+</body>
+</html>
+)HTML";
+  webServer.send(200, "text/html; charset=utf-8", PAGE);
+}
+
+static void handleWebStatus() {
+  String json = "{";
+  json += "\"ip\":\"" + WiFi.softAPIP().toString() + "\",";
+  json += "\"moisture\":" + String(sim_moisture, 1) + ",";
+  json += "\"temp1\":" + String(sim_temp, 1) + ",";
+  json += "\"temp2\":" + String(sim_temp2, 1) + ",";
+  json += "\"temp3\":" + String(sim_temp3, 1) + ",";
+  json += "\"soilTemp\":" + String(sim_soil_temp, 1) + ",";
+  json += "\"soilHum\":" + String(sim_soil_humidity, 1) + ",";
+  json += "\"relayFan\":" + String(relay_fan ? "true" : "false") + ",";
+  json += "\"relayWater\":" + String(relay_water ? "true" : "false");
+  json += "}";
+  webServer.send(200, "application/json", json);
+}
+
+static void handleWebSetTime() {
+  if (!webServer.hasArg("ts")) {
+    webServer.send(400, "text/plain", "missing ts");
+    return;
+  }
+  uint32_t ts = (uint32_t)webServer.arg("ts").toInt();
+  if (ts < 1000000000UL) {
+    webServer.send(400, "text/plain", "invalid ts");
+    return;
+  }
+  syncedEpoch = ts;
+  syncedAtMs = millis();
+  hasTimeSync = true;
+  webServer.send(200, "text/plain", "ok");
+}
+
+static void startWebServer() {
+  WiFi.mode(WIFI_AP);
+  bool apOk = WiFi.softAP(WEB_AP_SSID, WEB_AP_PASSWORD);
+  if (apOk) {
+    Serial.printf("AP ready: %s\n", WEB_AP_SSID);
+    Serial.print("Open http://");
+    Serial.println(WiFi.softAPIP());
+  } else {
+    Serial.println("AP start failed");
+  }
+
+  webServer.on("/", handleWebRoot);
+  webServer.on("/api/status", handleWebStatus);
+  webServer.on("/api/setTime", handleWebSetTime);
+  webServer.begin();
+  Serial.printf("Web server started on port %d\n", WEB_SERVER_PORT);
+}
 
 static void getTimeString(char* buf, size_t len) {
-  unsigned long s = millis() / 1000;
+  unsigned long s;
+  if (hasTimeSync) {
+    s = syncedEpoch + ((millis() - syncedAtMs) / 1000UL);
+  } else {
+    s = millis() / 1000UL;
+  }
   snprintf(buf, len, "%02lu:%02lu", (s / 3600) % 24, (s / 60) % 60);
 }
 
@@ -298,12 +427,14 @@ void setup() {
   digitalWrite(RELAY_FAN_PIN, relay_fan ? RELAY_ON : !RELAY_ON);
   digitalWrite(RELAY_WATER_PIN, relay_water ? RELAY_ON : !RELAY_ON);
 
+  startWebServer();
   screenGrid();
   lastDraw = lastSimUpdate = millis();
 }
 
 void loop() {
   uint32_t now = millis();
+  webServer.handleClient();
 
   if (now - lastSimUpdate >= (uint32_t)SIM_UPDATE_MS) {
     lastSimUpdate = now;
